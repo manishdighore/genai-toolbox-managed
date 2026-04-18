@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:mcp-toolbox.dev)",
+      "Bash(curl -s \"https://api.github.com/search/code?q=repo:googleapis/genai-toolbox+secret&per_page=50\")",
+      "WebFetch(domain:googleapis.github.io)",
+      "Bash(git clone:*)",
+      "Bash(grep -n \"ServerConfig\" /Users/manishdighore/Documents/VSCode/dbmcp/fork/internal/server/*.go)",
+      "Bash(grep \"const resourceType\" /Users/manishdighore/Documents/VSCode/dbmcp/fork/internal/tools/*/*/**.go)",
+      "Bash(grep -n \"func.*ToolsetConfig.*Initialize\" /Users/manishdighore/Documents/VSCode/dbmcp/fork/internal/tools/*.go)",
+      "Bash(grep -n \"func.*SetResources\" /Users/manishdighore/Documents/VSCode/dbmcp/fork/internal/server/resources/*.go)",
+      "Bash(grep -n \"NewStrictDecoder\" /Users/manishdighore/Documents/VSCode/dbmcp/fork/internal/util/*.go)",
+      "Bash(grep -A 20 \"func NewStrictDecoder\" /Users/manishdighore/Documents/VSCode/dbmcp/fork/internal/util/*.go)"
+    ]
+  }
+}

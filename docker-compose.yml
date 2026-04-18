@@ -1,0 +1,38 @@
+services:
+  dbmcp:
+    build:
+      context: ./fork
+      dockerfile: Dockerfile.dbmcp
+      args:
+        TARGETOS: linux
+        TARGETARCH: arm64   # change to amd64 for Intel/AMD hosts
+    image: dbmcp:local
+    ports:
+      - "5001:5001"
+    volumes:
+      # SQLite data persisted on the host — never inside the image.
+      - dbmcp-data:/data
+    environment:
+      # Required: 32-byte hex key for AES-256-GCM encryption of secrets.
+      # Generate with: openssl rand -hex 32
+      - TOOLBOX_ENCRYPTION_KEY=${DBMCP_ENCRYPTION_KEY:?DBMCP_ENCRYPTION_KEY is required}
+    # Pass all flags via CMD override so they're visible in `docker inspect`.
+    command:
+      - "--config-mode=db"
+      - "--security-tier=local"
+      - "--port=5001"
+      - "--db-url=file:/data/dbmcp.sqlite?_journal_mode=WAL"
+      - "--secrets-backend=sqlite"
+      - "--secrets-file=/data/dbmcp-secrets.sqlite"
+      - "--encryption-key=${DBMCP_ENCRYPTION_KEY}"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5001/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  dbmcp-data:
+    driver: local

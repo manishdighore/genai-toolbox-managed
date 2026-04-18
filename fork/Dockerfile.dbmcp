@@ -1,0 +1,50 @@
+# ── Build stage ───────────────────────────────────────────────────────────────
+FROM golang:1.26-alpine AS build
+
+# No CGO needed — we use modernc.org/sqlite (pure Go).
+ENV CGO_ENABLED=0
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -tags nooracle \
+    -o /toolbox \
+    -ldflags="-s -w" \
+    .
+
+# ── Runtime stage ──────────────────────────────────────────────────────────────
+# distroless/static: no shell, no package manager — minimal attack surface.
+# Works with CGO_ENABLED=0 pure-Go binaries.
+FROM gcr.io/distroless/static-debian12:nonroot
+
+WORKDIR /app
+
+# Data directory — mount a volume here to persist SQLite files across restarts.
+VOLUME ["/data"]
+
+COPY --from=build --chown=nonroot:nonroot /toolbox /toolbox
+
+EXPOSE 5001
+
+USER nonroot
+
+ENTRYPOINT ["/toolbox", "serve"]
+
+# Default: local tier, SQLite-backed.
+# Override individual flags with environment variables or docker-compose.
+CMD [ \
+    "--address=0.0.0.0", \
+    "--config-mode=db", \
+    "--security-tier=local", \
+    "--port=5001", \
+    "--db-url=file:/data/dbmcp.sqlite?_journal_mode=WAL", \
+    "--secrets-backend=sqlite", \
+    "--secrets-file=/data/dbmcp-secrets.sqlite" \
+]

@@ -1,0 +1,41 @@
+# direnv
+.envrc
+
+# vscode
+.vscode/
+
+# idea
+.idea/
+
+# npm
+node_modules
+
+# hugo
+.hugo/public/
+.hugo/resources/_gen
+.hugo/static/pagefind/
+.hugo_build.lock
+
+# coverage
+.coverage
+
+# python
+__pycache__/
+
+# executable
+genai-toolbox
+toolbox
+toolbox.exe
+dbmcp
+db-mcp
+
+# db-mcp runtime data
+dbmcp-data/
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.encryption_key
+.env
+.env.*
+!.env.example
