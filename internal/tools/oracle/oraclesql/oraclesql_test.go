@@ -1,4 +1,7 @@
 // Copyright © 2025, Oracle and/or its affiliates.
+
+//go:build !nooracle
+
 package oraclesql_test
 
 import (

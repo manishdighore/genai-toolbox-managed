@@ -36,10 +36,11 @@ import (
 	"github.com/go-chi/render"
 	"github.com/googleapis/mcp-toolbox/internal/auth"
 	"github.com/googleapis/mcp-toolbox/internal/auth/generic"
+	"github.com/googleapis/mcp-toolbox/internal/connections"
 	"github.com/googleapis/mcp-toolbox/internal/embeddingmodels"
 	"github.com/googleapis/mcp-toolbox/internal/log"
 	"github.com/googleapis/mcp-toolbox/internal/prompts"
-	"github.com/googleapis/mcp-toolbox/internal/server/mcp/jsonrpc"
+	"github.com/googleapis/mcp-toolbox/internal/secrets"
 	"github.com/googleapis/mcp-toolbox/internal/server/resources"
 	"github.com/googleapis/mcp-toolbox/internal/sources"
 	"github.com/googleapis/mcp-toolbox/internal/telemetry"
@@ -61,6 +62,14 @@ type Server struct {
 	sseManager      *sseManager
 	ResourceMgr     *resources.ResourceManager
 	mcpPrmFile      string
+
+	// DB mode — only populated when cfg.ConfigMode == "db".
+	connStore       *connections.Store
+	secretsProvider secrets.Provider
+	stagingStore    *StagingStore
+	keyStore        *KeyStore
+	pendingStore    *PendingStore
+	scopedIssuer    ScopedTokenIssuer
 }
 
 func InitializeConfigs(ctx context.Context, cfg ServerConfig) (
@@ -367,6 +376,33 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	logger := l.SlogLogger()
 	r.Use(httplog.RequestLogger(logger, httpOpts))
 
+	// cors — must be registered before any routes (including DB-mode mounts below).
+	if slices.Contains(cfg.AllowedOrigins, "*") {
+		l.WarnContext(ctx, "wildcard (`*`) allows all origin to access the resource and is not secure. Use it with cautious for public, non-sensitive data, or during local development. Recommended to use `--allowed-origins` flag")
+	}
+	corsOpts := cors.Options{
+		AllowedOrigins:   cfg.AllowedOrigins,
+		AllowedMethods:   []string{"GET", "POST", "DELETE", "OPTIONS"},
+		AllowCredentials: true,
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token", "Mcp-Session-Id", "MCP-Protocol-Version"},
+		ExposedHeaders:   []string{"Mcp-Session-Id"},
+		MaxAge:           300,
+	}
+	r.Use(cors.Handler(corsOpts))
+	// validate hosts for DNS rebinding attacks
+	if slices.Contains(cfg.AllowedHosts, "*") {
+		l.WarnContext(ctx, "wildcard (`*`) allows all hosts to access the resource and is not secure. Use it with cautious for public, non-sensitive data, or during local development. Recommended to use `--allowed-hosts` flag to prevent DNS rebinding attacks")
+	}
+	allowedHostsMap := make(map[string]struct{}, len(cfg.AllowedHosts))
+	for _, h := range cfg.AllowedHosts {
+		hostname := h
+		if host, _, err := net.SplitHostPort(h); err == nil {
+			hostname = host
+		}
+		allowedHostsMap[hostname] = struct{}{}
+	}
+	r.Use(hostCheck(allowedHostsMap))
+
 	sourcesMap, authServicesMap, embeddingModelsMap, toolsMap, toolsetsMap, promptsMap, promptsetsMap, err := InitializeConfigs(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("unable to initialize configs: %w", err)
@@ -391,32 +427,87 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		mcpPrmFile:      cfg.McpPrmFile,
 	}
 
-	// cors
-	if slices.Contains(cfg.AllowedOrigins, "*") {
-		s.logger.WarnContext(ctx, "wildcard (*) allows any website to access the resources. This creates a security risk regardless of whether you are in a production or local development environment. Recommended to use --allowed-origins with specific local addresses.")
-	}
-	corsOpts := cors.Options{
-		AllowedOrigins:   cfg.AllowedOrigins,
-		AllowedMethods:   []string{"GET", "POST", "DELETE", "OPTIONS"},
-		AllowCredentials: true, // required since Toolbox uses auth headers
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token", "Mcp-Session-Id", "MCP-Protocol-Version"},
-		ExposedHeaders:   []string{"Mcp-Session-Id"}, // headers that are sent to clients
-		MaxAge:           300,                        // cache preflight results for 5 minutes
-	}
-	r.Use(cors.Handler(corsOpts))
-	// validate hosts for DNS rebinding attacks
-	if slices.Contains(cfg.AllowedHosts, "*") {
-		s.logger.WarnContext(ctx, "wildcard (*) hosts allow any domain to access this resource, making it vulnerable to DNS rebinding attacks regardless of whether you are in a production or local development environment. For improved security, use the --allowed-hosts flag to specify trusted domains.")
-	}
-	allowedHostsMap := make(map[string]struct{}, len(cfg.AllowedHosts))
-	for _, h := range cfg.AllowedHosts {
-		hostname := h
-		if host, _, err := net.SplitHostPort(h); err == nil {
-			hostname = host
+	// DB mode — initialize connection management infrastructure and mount extra routes.
+	if cfg.ConfigMode == "db" {
+		connStore, err := connections.NewStore(cfg.DBURL)
+		if err != nil {
+			return nil, fmt.Errorf("opening connection store: %w", err)
 		}
-		allowedHostsMap[hostname] = struct{}{}
+		s.connStore = connStore
+
+		secretsProvider, err := secrets.New(ctx, secrets.Config{
+			Backend:          secrets.Backend(cfg.SecretsBackend),
+			SecretsFile:      cfg.SecretsFile,
+			EncryptionKey:    cfg.EncryptionKey,
+			GCPProject:       cfg.GCPProject,
+			AWSRegion:        cfg.AWSRegion,
+			AzureKeyVaultURL: cfg.AzureKeyVaultURL,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("initializing secrets provider: %w", err)
+		}
+		s.secretsProvider = secretsProvider
+
+		// Security middleware — log redaction runs before any handler.
+		r.Use(LogRedactionMiddleware)
+		r.Use(HTTPSRedirectMiddleware)
+
+		// Staging store is used by all security tiers.
+		s.stagingStore = NewStagingStore()
+
+		// Enterprise and SaaS tiers add RSA-OAEP key rotation.
+		if cfg.SecurityTier == "enterprise" || cfg.SecurityTier == "saas" {
+			ks, err := NewKeyStore()
+			if err != nil {
+				return nil, fmt.Errorf("initializing RSA key store: %w", err)
+			}
+			s.keyStore = ks
+		}
+
+		// SaaS tier: two-phase prepare/confirm with client-side direct-write to secrets manager.
+		if cfg.SecurityTier == "saas" {
+			s.pendingStore = newPendingStore()
+			switch cfg.SecretsBackend {
+			case "gcp":
+				s.scopedIssuer = &GCPScopedIssuer{
+					ProjectID:              cfg.GCPProject,
+					UploaderServiceAccount: cfg.SaaSUploaderSA,
+				}
+			case "aws":
+				s.scopedIssuer = &AWSScopedIssuer{
+					Region:          cfg.AWSRegion,
+					UploaderRoleARN: cfg.SaaSUploaderSA,
+				}
+			case "azure":
+				s.scopedIssuer = &AzureScopedIssuer{
+					KeyVaultURL: cfg.AzureKeyVaultURL,
+				}
+			default:
+				return nil, fmt.Errorf("SaaS tier requires a cloud secrets backend (gcp/aws/azure), got %q", cfg.SecretsBackend)
+			}
+		}
+
+		// Mount credential staging endpoints under /api/credentials/.
+		credR := chi.NewRouter()
+		credR.Use(middleware.StripSlashes)
+		credR.Use(render.SetContentType(render.ContentTypeJSON))
+		credR.Post("/stage", func(w http.ResponseWriter, req *http.Request) { stageCredentialHandler(s, w, req) })
+		credR.Get("/public-key", func(w http.ResponseWriter, req *http.Request) { publicKeyHandler(s, w, req) })
+		r.Mount("/api/credentials", credR)
+
+		// Mount connection management CRUD under /api/connections/.
+		mgmtR, err := managementRouter(s)
+		if err != nil {
+			return nil, fmt.Errorf("building management router: %w", err)
+		}
+		r.Mount("/api/connections", mgmtR)
+
+		// Load initial connection config from the management DB.
+		if err := s.reloadFromDB(ctx); err != nil {
+			// Log but don't fail — the DB may be empty on first run.
+			l.WarnContext(ctx, fmt.Sprintf("initial DB config load: %v", err))
+		}
 	}
-	r.Use(hostCheck(allowedHostsMap))
 
 	// Host OAuth Protected Resource Metadata endpoint
 	mcpAuthEnabled := false
@@ -485,6 +576,17 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		}
 		r.Mount("/ui", webR)
 	}
+	// API docs — always available, served from embedded static files.
+	r.Mount("/docs", docsRouter())
+	r.Get("/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
+		data, err := staticContent.ReadFile("static/openapi.yaml")
+		if err != nil {
+			http.Error(w, "openapi.yaml not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/yaml")
+		_, _ = w.Write(data)
+	})
 	// default endpoint for validating server is running
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("🧰 Hello, World! 🧰"))
@@ -511,8 +613,7 @@ func mcpAuthMiddleware(s *Server) func(http.Handler) http.Handler {
 				return
 			}
 
-			claims, err := mcpSvc.ValidateMCPAuth(r.Context(), r.Header)
-			if err != nil {
+			if _, err := mcpSvc.ValidateMCPAuth(r.Context(), r.Header); err != nil {
 				var mcpErr *generic.MCPAuthError
 				if errors.As(err, &mcpErr) {
 					switch mcpErr.Code {
@@ -522,32 +623,335 @@ func mcpAuthMiddleware(s *Server) func(http.Handler) http.Handler {
 							scopesArg = fmt.Sprintf(`, scope="%s"`, strings.Join(mcpErr.ScopesRequired, " "))
 						}
 						w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer resource_metadata="%s"%s`, s.toolboxUrl+"/.well-known/oauth-protected-resource", scopesArg))
-						render.Status(r, http.StatusUnauthorized)
-						render.JSON(w, r, jsonrpc.NewError(nil, jsonrpc.UNAUTHORIZED, mcpErr.Message, nil))
+						http.Error(w, mcpErr.Message, http.StatusUnauthorized)
 						return
 					case http.StatusForbidden:
 						w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer error="insufficient_scope", scope="%s", resource_metadata="%s", error_description="%s"`, strings.Join(mcpErr.ScopesRequired, " "), s.toolboxUrl+"/.well-known/oauth-protected-resource", mcpErr.Message))
-						render.Status(r, http.StatusForbidden)
-						render.JSON(w, r, jsonrpc.NewError(nil, jsonrpc.FORBIDDEN, mcpErr.Message, nil))
+						http.Error(w, mcpErr.Message, http.StatusForbidden)
 						return
 					}
 				}
-				// Fail closed on unexpected errors
-				s.logger.ErrorContext(r.Context(), "unexpected error during MCP auth validation", "error", err)
-				render.Status(r, http.StatusInternalServerError)
-				render.JSON(w, r, jsonrpc.NewError(nil, jsonrpc.INTERNAL_ERROR, "Internal Server Error", nil))
-				return
 			}
-
-			ctx := util.WithAuthTokenClaims(r.Context(), claims)
-			r = r.WithContext(ctx)
 
 			next.ServeHTTP(w, r)
 		})
 	}
 }
 
-// Listen starts a listener for the given Server instance.
+// reloadFromDB rebuilds Toolbox sources and tools from all connections in the
+// management DB. Called at startup and after every connection mutation.
+// Individual connection failures are logged as warnings and skipped — the rest
+// of the connections remain operational.
+func (s *Server) reloadFromDB(ctx context.Context) error {
+	conns, err := s.connStore.List(ctx)
+	if err != nil {
+		return fmt.Errorf("listing connections: %w", err)
+	}
+
+	allSources := make(map[string]sources.Source)
+	allTools := make(map[string]tools.Tool)
+
+	for _, conn := range conns {
+		password, err := s.secretsProvider.Get(ctx, conn.PasswordRef)
+		if err != nil {
+			s.logger.WarnContext(ctx, fmt.Sprintf("skipping connection %q: cannot fetch credentials: %v", conn.Name, err))
+			continue
+		}
+
+		sourceType, toolTypes, ok := dbTypeToToolboxTypes(conn.DBType)
+		if !ok {
+			s.logger.WarnContext(ctx, fmt.Sprintf("skipping connection %q: unsupported db_type %q", conn.Name, conn.DBType))
+			continue
+		}
+
+		// Build source config using the same factory machinery as YAML loading.
+		extra := conn.ExtraParamsMap()
+		srcMap := buildSourceConfigMap(sourceType, conn, password, extra)
+		srcCfg, err := UnmarshalYAMLSourceConfig(ctx, conn.Name, srcMap)
+		if err != nil {
+			s.logger.WarnContext(ctx, fmt.Sprintf("skipping connection %q: source config error: %v", conn.Name, err))
+			continue
+		}
+
+		// Initialize the source once — shared by all tools for this connection.
+		src, err := srcCfg.Initialize(ctx, s.instrumentation.Tracer)
+		if err != nil {
+			s.logger.WarnContext(ctx, fmt.Sprintf("skipping connection %q: source init error: %v", conn.Name, err))
+			continue
+		}
+		allSources[conn.Name] = src
+
+		// Register one tool per tool type supported by this database.
+		for _, toolType := range toolTypes {
+			toolKey := conn.Name + "__" + toolType
+			toolCfg, err := UnmarshalYAMLToolConfig(ctx, toolKey, map[string]any{
+				"type":        toolType,
+				"source":      conn.Name,
+				"description": defaultToolDescription(toolType, conn.Name, conn.DBType),
+			})
+			if err != nil {
+				s.logger.WarnContext(ctx, fmt.Sprintf("skipping tool %q for %q: %v", toolType, conn.Name, err))
+				continue
+			}
+			tool, err := toolCfg.Initialize(map[string]sources.Source{conn.Name: src})
+			if err != nil {
+				s.logger.WarnContext(ctx, fmt.Sprintf("skipping tool %q for %q: init error: %v", toolType, conn.Name, err))
+				continue
+			}
+			allTools[toolKey] = tool
+		}
+	}
+
+	// Build toolsets: one default (all connections) + one per connection.
+	allToolNames := make([]string, 0, len(allTools))
+	for name := range allTools {
+		allToolNames = append(allToolNames, name)
+	}
+	defaultToolset, err := tools.ToolsetConfig{Name: "", ToolNames: allToolNames}.Initialize(s.version, allTools)
+	if err != nil {
+		return fmt.Errorf("building default toolset: %w", err)
+	}
+
+	// Build per-connection tool key lists for toolset registration.
+	connToolKeys := make(map[string][]string)
+	for toolKey := range allTools {
+		// toolKey format: "ConnName__tool-type"
+		connName := strings.SplitN(toolKey, "__", 2)[0]
+		connToolKeys[connName] = append(connToolKeys[connName], toolKey)
+	}
+
+	// Per-connection toolsets + matching empty promptsets so MCP lookup succeeds.
+	emptyPrompts := make(map[string]prompts.Prompt)
+	defaultPromptset, _ := prompts.PromptsetConfig{Name: ""}.Initialize(s.version, emptyPrompts)
+	toolsetsMap := map[string]tools.Toolset{"": defaultToolset}
+	promptsetsMap := map[string]prompts.Promptset{"": defaultPromptset}
+
+	for connName, toolKeys := range connToolKeys {
+		ts, err := tools.ToolsetConfig{Name: connName, ToolNames: toolKeys}.Initialize(s.version, allTools)
+		if err != nil {
+			s.logger.WarnContext(ctx, fmt.Sprintf("skipping per-connection toolset %q: %v", connName, err))
+			continue
+		}
+		toolsetsMap[connName] = ts
+
+		ps, err := prompts.PromptsetConfig{Name: connName}.Initialize(s.version, emptyPrompts)
+		if err != nil {
+			s.logger.WarnContext(ctx, fmt.Sprintf("skipping per-connection promptset %q: %v", connName, err))
+			continue
+		}
+		promptsetsMap[connName] = ps
+	}
+
+	s.ResourceMgr.SetResources(
+		allSources,
+		make(map[string]auth.AuthService),
+		make(map[string]embeddingmodels.EmbeddingModel),
+		allTools,
+		toolsetsMap,
+		emptyPrompts,
+		promptsetsMap,
+	)
+
+	s.logger.InfoContext(ctx, fmt.Sprintf("loaded %d connection(s) from DB", len(allSources)))
+	return nil
+}
+
+// buildSourceConfigMap constructs the map passed to UnmarshalYAMLSourceConfig.
+// Different databases use different field names — this centralises the mapping.
+func buildSourceConfigMap(sourceType string, conn *connections.Connection, password string, extra map[string]string) map[string]any {
+	ep := func(key, fallback string) string {
+		if v, ok := extra[key]; ok && v != "" {
+			return v
+		}
+		return fallback
+	}
+
+	base := map[string]any{"type": sourceType}
+
+	switch sourceType {
+	// ── MongoDB — takes a full URI ─────────────────────────────────────────
+	case "mongodb":
+		uri := ep("uri", "")
+		if uri == "" {
+			// Build from parts: mongodb://user:pass@host:port/database
+			uri = fmt.Sprintf("mongodb://%s:%s@%s:%d/%s",
+				conn.Username, password, conn.Host, conn.Port, conn.Database)
+		}
+		base["uri"] = uri
+
+	// ── Neo4j — takes a URI + separate user/password/database ─────────────
+	case "neo4j":
+		scheme := ep("uri_scheme", "bolt")
+		base["uri"] = fmt.Sprintf("%s://%s:%d", scheme, conn.Host, conn.Port)
+		base["user"] = conn.Username
+		base["password"] = password
+		base["database"] = conn.Database
+
+	// ── Snowflake — account replaces host; schema required ────────────────
+	case "snowflake":
+		base["account"] = ep("account", conn.Host)
+		base["user"] = conn.Username
+		base["password"] = password
+		base["database"] = conn.Database
+		base["schema"] = ep("schema", "PUBLIC")
+		if wh := ep("warehouse", ""); wh != "" {
+			base["warehouse"] = wh
+		}
+		if role := ep("role", ""); role != "" {
+			base["role"] = role
+		}
+
+	// ── Cassandra — keyspace instead of database ───────────────────────────
+	case "cassandra":
+		base["host"] = conn.Host
+		base["port"] = strconv.Itoa(conn.Port)
+		base["username"] = conn.Username
+		base["password"] = password
+		base["keyspace"] = conn.Database // database field holds keyspace
+
+	// ── Redis / Valkey — no database or user fields required ──────────────
+	case "redis", "valkey":
+		base["host"] = conn.Host
+		base["port"] = strconv.Itoa(conn.Port)
+		base["password"] = password
+		if conn.Database != "" && conn.Database != "0" {
+			base["database"] = conn.Database
+		}
+
+	// ── Elasticsearch — host/port, optional user/password ─────────────────
+	case "elasticsearch":
+		base["host"] = conn.Host
+		base["port"] = strconv.Itoa(conn.Port)
+		if conn.Username != "" {
+			base["username"] = conn.Username
+		}
+		if password != "" {
+			base["password"] = password
+		}
+
+	// ── ClickHouse — standard fields + optional secure flag ───────────────
+	case "clickhouse":
+		base["host"] = conn.Host
+		base["port"] = strconv.Itoa(conn.Port)
+		base["user"] = conn.Username
+		base["password"] = password
+		base["database"] = conn.Database
+		base["secure"] = conn.SSLMode != "disable"
+
+	// ── Standard: postgres, mysql, mssql, sqlite, cockroachdb, yugabytedb,
+	//             tidb, cloud-sql-*, alloydb-postgres ─────────────────────
+	default:
+		base["host"] = conn.Host
+		base["port"] = strconv.Itoa(conn.Port)
+		base["user"] = conn.Username
+		base["password"] = password
+		base["database"] = conn.Database
+	}
+
+	return base
+}
+
+// dbTypeToToolboxTypes maps a connection's db_type to the Toolbox source and tool type strings.
+func dbTypeToToolboxTypes(dbType string) (sourceType string, toolTypes []string, ok bool) {
+	switch strings.ToLower(dbType) {
+	// ── Standard SQL ──────────────────────────────────────────────────────────
+	case "postgres", "postgresql":
+		return "postgres", []string{
+			"postgres-execute-sql",
+			"postgres-list-tables",
+			"postgres-list-schemas",
+			"postgres-list-views",
+			"postgres-list-indexes",
+			"postgres-list-triggers",
+			"postgres-list-roles",
+			"postgres-list-sequences",
+			"postgres-list-stored-procedure",
+			"postgres-database-overview",
+			"postgres-list-active-queries",
+			"postgres-list-locks",
+			"postgres-list-query-stats",
+			"postgres-list-table-stats",
+			"postgres-list-database-stats",
+			"postgres-list-tablespaces",
+			"postgres-list-pg-settings",
+			"postgres-list-available-extensions",
+			"postgres-list-installed-extensions",
+			"postgres-get-column-cardinality",
+			"postgres-long-running-transactions",
+		}, true
+	case "mysql", "mariadb":
+		return "mysql", []string{
+			"mysql-execute-sql",
+			"mysql-list-tables",
+			"mysql-list-active-queries",
+			"mysql-get-query-plan",
+			"mysql-list-table-fragmentation",
+			"mysql-list-tables-missing-unique-indexes",
+		}, true
+	case "mssql", "sqlserver", "sql_server":
+		return "mssql", []string{
+			"mssql-execute-sql",
+			"mssql-list-tables",
+		}, true
+	case "sqlite":
+		return "sqlite", []string{"sqlite-execute-sql"}, true
+	case "cockroachdb":
+		return "cockroachdb", []string{"cockroachdb-execute-sql"}, true
+	case "yugabytedb":
+		return "yugabytedb", []string{"yugabytedb-sql"}, true
+	case "tidb":
+		return "tidb", []string{
+			"mysql-execute-sql",
+			"mysql-list-tables",
+		}, true
+	// ── Analytical / columnar ──────────────────────────────────────────────
+	case "clickhouse":
+		return "clickhouse", []string{"clickhouse-execute-sql"}, true
+	case "snowflake":
+		return "snowflake", []string{"snowflake-execute-sql"}, true
+	// ── Google Cloud managed SQL ───────────────────────────────────────────
+	case "cloud-sql-postgres", "cloudsqlpostgres":
+		return "cloud-sql-postgres", []string{
+			"postgres-execute-sql",
+			"postgres-list-tables",
+			"postgres-list-schemas",
+		}, true
+	case "cloud-sql-mysql", "cloudsqlmysql":
+		return "cloud-sql-mysql", []string{
+			"mysql-execute-sql",
+			"mysql-list-tables",
+		}, true
+	case "cloud-sql-mssql", "cloudsqlmssql":
+		return "cloud-sql-mssql", []string{
+			"mssql-execute-sql",
+			"mssql-list-tables",
+		}, true
+	case "alloydb-postgres", "alloydb":
+		return "alloydb-postgres", []string{
+			"postgres-execute-sql",
+			"postgres-list-tables",
+			"postgres-list-schemas",
+		}, true
+	// ── NoSQL / graph / search ─────────────────────────────────────────────
+	case "mongodb":
+		return "mongodb", []string{"mongodb-find"}, true
+	case "redis":
+		return "redis", []string{"redis"}, true
+	case "valkey":
+		return "valkey", []string{"valkey"}, true
+	case "neo4j":
+		return "neo4j", []string{"neo4j-execute-cypher"}, true
+	case "cassandra":
+		return "cassandra", []string{"cassandra-cql"}, true
+	case "elasticsearch":
+		return "elasticsearch", []string{"elasticsearch-esql"}, true
+	default:
+		return "", nil, false
+	}
+}
+
+// Listen starts a listener for the given Server instance. If certFile and
+// keyFile are provided, the listener is wrapped with TLS.
 func (s *Server) Listen(ctx context.Context, certFile, keyFile string) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -562,13 +966,11 @@ func (s *Server) Listen(ctx context.Context, certFile, keyFile string) error {
 	}
 
 	if certFile != "" || keyFile != "" {
-		// Load the certificates
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
 			ln.Close()
 			return fmt.Errorf("failed to load TLS key pair (cert: %q, key: %q): %w", certFile, keyFile, err)
 		}
-		// Wrap the listener with TLS
 		config := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 		s.listener = tls.NewListener(ln, config)
 		s.logger.DebugContext(ctx, fmt.Sprintf("secure server listening on %s", s.srv.Addr))
@@ -596,8 +998,4 @@ func (s *Server) ServeStdio(ctx context.Context, stdin io.Reader, stdout io.Writ
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.DebugContext(ctx, "shutting down the server.")
 	return s.srv.Shutdown(ctx)
-}
-
-func (s *Server) Addr() string {
-	return s.listener.Addr().String()
 }

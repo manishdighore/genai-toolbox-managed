@@ -1,0 +1,847 @@
+openapi: 3.1.0
+info:
+  title: DB-MCP Connection Management API
+  version: "1.0"
+  description: |
+    REST API for managing database connections served by the MCP Toolbox for Databases.
+
+    Each connection you create automatically gets a live MCP endpoint at
+    `/mcp/{connection-name}` — ready for use by any MCP-compatible AI client.
+
+    ## Security Tiers
+
+    | Tier | How credentials travel |
+    |------|----------------------|
+    | **local** | Stage plaintext password via `POST /api/credentials/stage`, get a short-lived token |
+    | **enterprise** | Encrypt password client-side with the server's RSA public key, stage encrypted blob |
+    | **saas** | Two-phase commit — server never sees the password (`/prepare` → write to secrets manager → `/confirm`) |
+
+    ## Typical Flow (local / enterprise tier)
+    1. `POST /api/credentials/stage` → get `credential_token`
+    2. `POST /api/connections` with `credential_token` → connection created, MCP endpoint live
+    3. Use `/mcp/{name}` from your AI client
+
+servers:
+  - url: http://localhost:5000
+    description: Local development server
+
+tags:
+  - name: credentials
+    description: Secure credential staging (avoids sending raw passwords in connection API calls)
+  - name: connections
+    description: Connection lifecycle — CRUD, test, and MCP endpoint management
+  - name: saas
+    description: SaaS two-phase credential flow (server never handles plaintext password)
+  - name: mcp
+    description: MCP protocol endpoints — one per saved connection
+
+paths:
+
+  # ---------------------------------------------------------------------------
+  # Credential Staging
+  # ---------------------------------------------------------------------------
+
+  /api/credentials/stage:
+    post:
+      tags: [credentials]
+      summary: Stage a credential and get a short-lived token
+      description: |
+        Securely stage a database password and receive a single-use token valid for 5 minutes.
+        Pass `credential_token` to any connection endpoint instead of the raw password.
+
+        **Local tier:** send `password` (plaintext — always use HTTPS in production).
+
+        **Enterprise tier:** send `encrypted_password` (RSA-OAEP, base64-encoded) + `key_id`
+        obtained from `GET /api/credentials/public-key`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/StageLocalRequest'
+                - $ref: '#/components/schemas/StageEnterpriseRequest'
+            examples:
+              local:
+                summary: Local tier — plaintext password
+                value:
+                  password: "myS3cureP@ss"
+              enterprise:
+                summary: Enterprise tier — RSA-OAEP encrypted
+                value:
+                  encrypted_password: "base64encodedCiphertext=="
+                  key_id: "kid-2026-01"
+      responses:
+        "200":
+          description: Token issued successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StageResponse'
+              example:
+                credential_token: "ctok_a1b2c3d4e5f6..."
+                expires_at: "2026-04-07T12:05:00Z"
+                note: "single-use, expires in 5 minutes — use immediately in POST /api/connections or POST /api/connections/test"
+        "400":
+          $ref: '#/components/responses/BadRequest'
+
+  /api/credentials/public-key:
+    get:
+      tags: [credentials]
+      summary: Get the server's RSA public key (enterprise tier only)
+      description: |
+        Returns the current RSA public key used to encrypt passwords for the enterprise tier.
+        Clients encrypt the password with OAEP+SHA256 before calling `/api/credentials/stage`.
+
+        Only available when `--security-tier=enterprise`.
+      responses:
+        "200":
+          description: Public key details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicKeyResponse'
+              example:
+                key_id: "kid-2026-01"
+                algorithm: "RSA-OAEP-SHA256"
+                public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq..."
+                key_size_bits: 4096
+        "404":
+          description: Enterprise tier not enabled
+
+  # ---------------------------------------------------------------------------
+  # Connection CRUD
+  # ---------------------------------------------------------------------------
+
+  /api/connections:
+    get:
+      tags: [connections]
+      summary: List all connections
+      description: Returns all saved database connections. Passwords and secret references are never included.
+      responses:
+        "200":
+          description: List of connections
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Connection'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      tags: [connections]
+      summary: Create a connection
+      description: |
+        Tests connectivity, stores credentials in the secrets backend, persists the connection,
+        and immediately makes the MCP endpoint live at `/mcp/{name}`.
+
+        The connection is only saved if the connectivity test passes.
+        Provide either `credential_token` (preferred) or `password` (local tier only).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRequest'
+            examples:
+              with_token:
+                summary: Using a credential token (recommended)
+                value:
+                  name: "prod-postgres"
+                  db_type: "postgres"
+                  host: "db.example.com"
+                  port: 5432
+                  database: "myapp"
+                  username: "app_user"
+                  credential_token: "ctok_a1b2c3d4..."
+                  ssl_mode: "require"
+                  description: "Production Postgres"
+              with_password:
+                summary: Direct password (local tier only)
+                value:
+                  name: "local-mysql"
+                  db_type: "mysql"
+                  host: "localhost"
+                  port: 3306
+                  database: "dev"
+                  username: "root"
+                  password: "secret"
+                  ssl_mode: "disable"
+      responses:
+        "201":
+          description: Connection created and MCP endpoint is live
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "409":
+          description: A connection with this name already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "422":
+          description: Connectivity test failed — credentials not saved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestFailedResponse'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /api/connections/test:
+    post:
+      tags: [connections]
+      summary: Pre-save connectivity test
+      description: |
+        Test database credentials without saving anything. Use this for the "Test Connection"
+        button in your UI before the user confirms saving.
+
+        Always returns HTTP 200 — inspect the `ok` field to check pass/fail.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRequest'
+            example:
+              name: "test-conn"
+              db_type: "postgres"
+              host: "db.example.com"
+              port: 5432
+              database: "myapp"
+              username: "app_user"
+              credential_token: "ctok_a1b2c3d4..."
+      responses:
+        "200":
+          description: Test result (always 200 — check `ok`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestResult'
+              examples:
+                success:
+                  value:
+                    ok: true
+                    latency_ms: 12
+                    server_version: "PostgreSQL 16.2"
+                    message: "connection successful"
+                failure:
+                  value:
+                    ok: false
+                    latency_ms: null
+                    message: "dial tcp db.example.com:5432: connection refused"
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "422":
+          $ref: '#/components/responses/ValidationError'
+
+  /api/connections/reload:
+    post:
+      tags: [connections]
+      summary: Force reload from database
+      description: |
+        Trigger a full config regeneration from the management database.
+        Normally happens automatically after every mutation. Use this for
+        manual recovery if an automatic reload failed.
+      responses:
+        "200":
+          description: Reload successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+                  connections_reloaded:
+                    type: integer
+                    example: 5
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /api/connections/{id}:
+    get:
+      tags: [connections]
+      summary: Get a connection by ID
+      parameters:
+        - $ref: '#/components/parameters/ConnectionID'
+      responses:
+        "200":
+          description: Connection details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+    put:
+      tags: [connections]
+      summary: Update a connection
+      description: |
+        Partial update — only provided fields are changed.
+        If `credential_token` or `password` is provided, credentials are rotated in the
+        secrets backend. The updated connection is tested before any changes are committed.
+      parameters:
+        - $ref: '#/components/parameters/ConnectionID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRequest'
+            examples:
+              change_host:
+                summary: Move to a new host
+                value:
+                  host: "new-db.example.com"
+                  port: 5432
+              rotate_password:
+                summary: Rotate password via token
+                value:
+                  credential_token: "ctok_newtoken..."
+      responses:
+        "200":
+          description: Connection updated and MCP endpoint reloaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "422":
+          description: Connectivity test failed — no changes saved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestFailedResponse'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags: [connections]
+      summary: Delete a connection
+      description: |
+        Removes the connection from the database, deletes the secret from the
+        secrets backend, and immediately removes the `/mcp/{name}` endpoint.
+      parameters:
+        - $ref: '#/components/parameters/ConnectionID'
+      responses:
+        "200":
+          description: Connection deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: string
+                    example: "conn_abc123"
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /api/connections/{id}/test:
+    post:
+      tags: [connections]
+      summary: Test an existing saved connection
+      description: |
+        Re-test a saved connection using its stored credentials.
+        Updates `last_tested_at` and `last_test_ok` regardless of outcome.
+        Does NOT modify the connection or trigger a reload.
+
+        Always returns HTTP 200 — inspect the `ok` field to check pass/fail.
+      parameters:
+        - $ref: '#/components/parameters/ConnectionID'
+      responses:
+        "200":
+          description: Test result (always 200 — check `ok`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestResult'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  # ---------------------------------------------------------------------------
+  # SaaS Two-Phase Flow
+  # ---------------------------------------------------------------------------
+
+  /api/connections/prepare:
+    post:
+      tags: [saas]
+      summary: "[SaaS] Prepare a connection slot — Phase 1"
+      description: |
+        **SaaS tier only.** The server never receives the plaintext password.
+
+        Phase 1 of the two-phase commit:
+        1. Validates connection metadata (no password required)
+        2. Pre-creates a secret slot in the secrets manager
+        3. Issues a short-lived, single-secret-scoped upload token
+        4. Returns the exact URL and credentials the client needs to write the password directly
+
+        The client then writes the password to `upload_url` using `upload_token` credentials,
+        and calls `POST /api/connections/confirm` with the `pending_id`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrepareRequest'
+            example:
+              name: "prod-postgres"
+              db_type: "postgres"
+              host: "db.example.com"
+              port: 5432
+              database: "myapp"
+              username: "app_user"
+              ssl_mode: "require"
+              description: "Production database"
+      responses:
+        "200":
+          description: Secret slot created, upload token issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrepareResponse'
+        "409":
+          description: Connection name already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "422":
+          $ref: '#/components/responses/ValidationError'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /api/connections/confirm:
+    post:
+      tags: [saas]
+      summary: "[SaaS] Confirm a connection — Phase 2"
+      description: |
+        **SaaS tier only.**
+
+        Phase 2 of the two-phase commit:
+        1. Verifies the client actually wrote the password to the secrets manager
+        2. Saves the connection to the database
+        3. Immediately makes the MCP endpoint live at `/mcp/{name}`
+
+        Must be called within 10 minutes of `POST /api/connections/prepare`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pending_id]
+              properties:
+                pending_id:
+                  type: string
+                  description: The `pending_id` from the prepare response
+                  example: "pnd_a1b2c3d4e5f6"
+      responses:
+        "201":
+          description: Connection confirmed and MCP endpoint live
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        "400":
+          description: Invalid or expired `pending_id`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "422":
+          description: Secret not found — password was not written to secrets manager
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  # ---------------------------------------------------------------------------
+  # MCP Endpoints (informational)
+  # ---------------------------------------------------------------------------
+
+  /mcp/{connectionName}:
+    get:
+      tags: [mcp]
+      summary: MCP endpoint for a saved connection
+      description: |
+        Each saved connection gets a dedicated MCP endpoint here.
+        Point your MCP-compatible AI client (Claude, Cursor, Copilot, etc.) at this URL.
+
+        Supports both SSE (`text/event-stream`) and streamable HTTP transports.
+        The available tools depend on `db_type`:
+        - **postgres / mysql / mssql** → `execute_sql`
+      parameters:
+        - name: connectionName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The `name` of a saved connection
+          example: "prod-postgres"
+      responses:
+        "200":
+          description: MCP SSE stream or streamable HTTP response
+
+# ---------------------------------------------------------------------------
+# Reusable components
+# ---------------------------------------------------------------------------
+
+components:
+  parameters:
+    ConnectionID:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Connection UUID
+      example: "550e8400-e29b-41d4-a716-446655440000"
+
+  schemas:
+
+    StageLocalRequest:
+      type: object
+      required: [password]
+      properties:
+        password:
+          type: string
+          description: Plaintext database password (local tier — use only over HTTPS)
+          example: "myS3cureP@ss"
+
+    StageEnterpriseRequest:
+      type: object
+      required: [encrypted_password, key_id]
+      properties:
+        encrypted_password:
+          type: string
+          description: RSA-OAEP+SHA256 encrypted password, base64-encoded
+          example: "base64encodedCiphertext=="
+        key_id:
+          type: string
+          description: Key ID from `GET /api/credentials/public-key`
+          example: "kid-2026-01"
+
+    StageResponse:
+      type: object
+      properties:
+        credential_token:
+          type: string
+          description: Single-use token (prefix `ctok_`), valid for 5 minutes
+          example: "ctok_a1b2c3d4e5f6..."
+        expires_at:
+          type: string
+          format: date-time
+          example: "2026-04-07T12:05:00Z"
+        note:
+          type: string
+
+    PublicKeyResponse:
+      type: object
+      properties:
+        key_id:
+          type: string
+          example: "kid-2026-01"
+        algorithm:
+          type: string
+          example: "RSA-OAEP-SHA256"
+        public_key_pem:
+          type: string
+          description: PEM-encoded RSA public key
+        key_size_bits:
+          type: integer
+          example: 4096
+
+    CreateRequest:
+      type: object
+      required: [name, db_type, host, port, database, username]
+      properties:
+        name:
+          type: string
+          description: Unique name (letters, digits, hyphens, underscores; max 63 chars)
+          pattern: '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$'
+          example: "prod-postgres"
+        db_type:
+          type: string
+          enum: [postgres, mysql, mssql]
+          example: "postgres"
+        host:
+          type: string
+          example: "db.example.com"
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          example: 5432
+        database:
+          type: string
+          example: "myapp"
+        username:
+          type: string
+          example: "app_user"
+        password:
+          type: string
+          description: Plaintext password (local tier only — prefer `credential_token`)
+          example: "secret"
+        credential_token:
+          type: string
+          description: Single-use token from `POST /api/credentials/stage` (preferred)
+          example: "ctok_a1b2c3d4..."
+        ssl_mode:
+          type: string
+          enum: [disable, require, verify-full]
+          default: require
+          example: "require"
+        description:
+          type: string
+          example: "Production Postgres database"
+
+    PrepareRequest:
+      type: object
+      required: [name, db_type, host, port, database, username]
+      properties:
+        name:
+          type: string
+          pattern: '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$'
+          example: "prod-postgres"
+        db_type:
+          type: string
+          enum: [postgres, mysql, mssql]
+        host:
+          type: string
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        database:
+          type: string
+        username:
+          type: string
+        ssl_mode:
+          type: string
+          enum: [disable, require, verify-full]
+          default: require
+        description:
+          type: string
+
+    UpdateRequest:
+      type: object
+      description: All fields optional — only provided fields are updated
+      properties:
+        host:
+          type: string
+          example: "new-db.example.com"
+        port:
+          type: integer
+          example: 5432
+        database:
+          type: string
+        username:
+          type: string
+        password:
+          type: string
+          description: Rotate password (direct plaintext — local tier only)
+        credential_token:
+          type: string
+          description: Rotate password via staged token (preferred)
+        ssl_mode:
+          type: string
+          enum: [disable, require, verify-full]
+        description:
+          type: string
+
+    Connection:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        name:
+          type: string
+          example: "prod-postgres"
+        db_type:
+          type: string
+          example: "postgres"
+        host:
+          type: string
+          example: "db.example.com"
+        port:
+          type: integer
+          example: 5432
+        database:
+          type: string
+          example: "myapp"
+        username:
+          type: string
+          example: "app_user"
+        ssl_mode:
+          type: string
+          example: "require"
+        description:
+          type: string
+          example: "Production Postgres database"
+        mcp_endpoint:
+          type: string
+          description: The MCP endpoint URL for this connection
+          example: "http://localhost:5000/mcp/prod-postgres"
+        last_tested_at:
+          type: string
+          format: date-time
+          nullable: true
+        last_test_ok:
+          type: boolean
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    TestResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          description: true = connection succeeded
+          example: true
+        latency_ms:
+          type: integer
+          nullable: true
+          description: Round-trip latency in milliseconds
+          example: 12
+        server_version:
+          type: string
+          description: Database server version string (when available)
+          example: "PostgreSQL 16.2"
+        message:
+          type: string
+          example: "connection successful"
+
+    TestFailedResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "connection test failed — credentials not saved"
+        test_result:
+          $ref: '#/components/schemas/TestResult'
+
+    PrepareResponse:
+      type: object
+      properties:
+        pending_id:
+          type: string
+          description: Use this in `POST /api/connections/confirm`
+          example: "pnd_a1b2c3d4e5f6"
+        secret_name:
+          type: string
+          description: The secret resource name — where to write the password
+          example: "projects/my-project/secrets/dbmcp-prod-postgres"
+        upload_url:
+          type: string
+          description: The exact API URL to POST/PUT the password to
+          example: "https://secretmanager.googleapis.com/v1/projects/my-project/secrets/dbmcp-prod-postgres:addVersion"
+        upload_token:
+          $ref: '#/components/schemas/UploadToken'
+        expires_at:
+          type: string
+          format: date-time
+          description: Confirm before this time (10 minutes from prepare)
+        instructions:
+          type: string
+          description: Human-readable steps for writing the secret
+
+    UploadToken:
+      type: object
+      description: Provider-specific credentials for writing directly to the secrets manager
+      properties:
+        access_token:
+          type: string
+          description: "GCP: short-lived OAuth2 access token"
+        aws_access_key_id:
+          type: string
+          description: "AWS: STS temporary key ID"
+        aws_secret_access_key:
+          type: string
+          description: "AWS: STS temporary secret"
+        aws_session_token:
+          type: string
+          description: "AWS: STS session token"
+        aws_region:
+          type: string
+          description: "AWS: region"
+        azure_token:
+          type: string
+          description: "Azure: short-lived Bearer token"
+        azure_vault_url:
+          type: string
+          description: "Azure: Key Vault base URL"
+
+    Error:
+      type: object
+      properties:
+        status:
+          type: string
+          example: "Bad Request"
+        error:
+          type: string
+          example: "name is required"
+
+  responses:
+    BadRequest:
+      description: Invalid request body or parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            status: "Bad Request"
+            error: "name is required"
+
+    ValidationError:
+      description: Request is valid JSON but fails business validation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    NotFound:
+      description: Connection not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            status: "Not Found"
+            error: "not found"
+
+    InternalError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            status: "Internal Server Error"
+            error: "database unavailable"

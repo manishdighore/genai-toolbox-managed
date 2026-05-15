@@ -61,8 +61,6 @@ func ConfigFileFlags(flags *pflag.FlagSet, opts *ToolboxOptions) {
 func ServeFlags(flags *pflag.FlagSet, opts *ToolboxOptions) {
 	flags.StringVarP(&opts.Cfg.Address, "address", "a", "127.0.0.1", "Address of the interface the server will listen on.")
 	flags.IntVarP(&opts.Cfg.Port, "port", "p", 5000, "Port the server will listen on.")
-	flags.StringVar(&opts.Cfg.CertFile, "tls-cert", "", "Path to TLS certificate file")
-	flags.StringVar(&opts.Cfg.KeyFile, "tls-key", "", "Path to TLS key file")
 	flags.BoolVar(&opts.Cfg.Stdio, "stdio", false, "Listens via MCP STDIO instead of acting as a remote HTTP server.")
 	flags.BoolVar(&opts.Cfg.UI, "ui", false, "Launches the Toolbox UI web server.")
 	flags.BoolVar(&opts.Cfg.EnableAPI, "enable-api", false, "Enable the /api endpoint.")
@@ -70,4 +68,18 @@ func ServeFlags(flags *pflag.FlagSet, opts *ToolboxOptions) {
 	flags.StringVar(&opts.Cfg.McpPrmFile, "mcp-prm-file", "", "Path to a manual Protected Resource Metadata (PRM) JSON file. If provided, overrides auto-generation.")
 	flags.StringSliceVar(&opts.Cfg.AllowedOrigins, "allowed-origins", []string{"*"}, "Specifies a list of origins permitted to access this server. Defaults to '*'.")
 	flags.StringSliceVar(&opts.Cfg.AllowedHosts, "allowed-hosts", []string{"*"}, "Specifies a list of hosts permitted to access this server. Defaults to '*'.")
+
+	// DB mode flags
+	flags.StringVar(&opts.Cfg.ConfigMode, "config-mode", "file", "Configuration mode: 'file' (YAML) or 'db' (database-backed connection management).")
+	flags.StringVar(&opts.Cfg.SecurityTier, "security-tier", "local", "Security tier: 'local', 'enterprise', or 'saas'.")
+	flags.StringVar(&opts.Cfg.DBURL, "db-url", "file:./dbmcp.sqlite?_journal_mode=WAL", "DSN for the connection management database (SQLite or Postgres).")
+	flags.StringVar(&opts.Cfg.SecretsBackend, "secrets-backend", "sqlite", "Secrets backend: 'sqlite', 'gcp', 'aws', or 'azure'.")
+	flags.StringVar(&opts.Cfg.SecretsFile, "secrets-file", "./dbmcp-secrets.sqlite", "Path to the SQLite secrets file (sqlite backend only).")
+	flags.StringVar(&opts.Cfg.EncryptionKey, "encryption-key", "", "32-byte hex key for AES-256-GCM encryption (sqlite backend only). Generate with: openssl rand -hex 32")
+	flags.StringVar(&opts.Cfg.GCPProject, "gcp-project", "", "GCP project ID for Secret Manager (gcp backend only).")
+	flags.StringVar(&opts.Cfg.AWSRegion, "aws-region", "", "AWS region for Secrets Manager (aws backend only).")
+	flags.StringVar(&opts.Cfg.AzureKeyVaultURL, "azure-keyvault-url", "", "Azure Key Vault URL, e.g. https://my-vault.vault.azure.net (azure backend only).")
+	flags.StringVar(&opts.Cfg.SaaSUploaderSA, "saas-uploader-sa", "", "Service account email (GCP) or role ARN (AWS) for issuing scoped upload tokens (saas tier only).")
+	flags.StringVar(&opts.Cfg.CertFile, "tls-cert", "", "Path to TLS certificate file for HTTPS.")
+	flags.StringVar(&opts.Cfg.KeyFile, "tls-key", "", "Path to TLS private key file for HTTPS.")
 }

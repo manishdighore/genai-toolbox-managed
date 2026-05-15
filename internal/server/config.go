@@ -40,10 +40,6 @@ type ServerConfig struct {
 	Address string
 	// Port is the port the server will listen on.
 	Port int
-	// CertFile is the path to tls certificate file
-	CertFile string
-	// KeyFile is the path to TLS key file
-	KeyFile string
 	// SourceConfigs defines what sources of data are available for tools.
 	SourceConfigs SourceConfigs
 	// AuthServiceConfigs defines what sources of authentication are available for tools.
@@ -88,6 +84,35 @@ type ServerConfig struct {
 	UserAgentMetadata []string
 	// PollInterval sets the polling frequency for configuration file updates.
 	PollInterval int
+
+	// --- DB mode settings ---
+
+	// ConfigMode is either "file" (default, YAML-backed) or "db" (DB-backed connection management).
+	ConfigMode string
+	// SecurityTier is one of "local", "enterprise", or "saas".
+	SecurityTier string
+	// DBURL is the DSN for the connection management database.
+	//   SQLite:   "file:./dbmcp.sqlite?_journal_mode=WAL"
+	//   Postgres: "postgres://user:pass@host/dbmcp"
+	DBURL string
+	// SecretsBackend selects the secrets provider: "sqlite", "gcp", "aws", or "azure".
+	SecretsBackend string
+	// SecretsFile is the path to the SQLite secrets file (sqlite backend only).
+	SecretsFile string
+	// EncryptionKey is a 32-byte hex string for AES-256-GCM encryption (sqlite backend only).
+	EncryptionKey string
+	// GCPProject is the GCP project ID (gcp backend only).
+	GCPProject string
+	// AWSRegion is the AWS region (aws backend only).
+	AWSRegion string
+	// AzureKeyVaultURL is the Azure Key Vault URL (azure backend only).
+	AzureKeyVaultURL string
+	// SaaSUploaderSA is the service account email (GCP) or role ARN (AWS) used to issue scoped upload tokens (saas tier only).
+	SaaSUploaderSA string
+	// CertFile is the path to the TLS certificate file.
+	CertFile string
+	// KeyFile is the path to the TLS private key file.
+	KeyFile string
 }
 
 type logFormat string
@@ -318,21 +343,6 @@ func UnmarshalYAMLToolConfig(ctx context.Context, name string, r map[string]any)
 	// Make `authRequired` an empty list instead of nil for Tool manifest
 	if r["authRequired"] == nil {
 		r["authRequired"] = []string{}
-	}
-
-	// Parse scopesRequired if present
-	if rawScopes, ok := r["scopesRequired"]; ok {
-		if scopesList, ok := rawScopes.([]any); ok {
-			var scopes []string
-			for _, s := range scopesList {
-				if str, ok := s.(string); ok {
-					scopes = append(scopes, str)
-				}
-			}
-			r["scopesRequired"] = scopes
-		} else {
-			return nil, fmt.Errorf("scopesRequired must be a list of strings")
-		}
 	}
 
 	// validify parameter references

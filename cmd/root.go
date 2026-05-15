@@ -87,7 +87,6 @@ func Execute() {
 	opts := internal.NewToolboxOptions()
 
 	if err := NewCommand(opts).Execute(); err != nil {
-		fmt.Fprintf(opts.IOStreams.ErrOut, "Error: %v\n", err)
 		exit := 1
 		os.Exit(exit)
 	}
@@ -106,7 +105,6 @@ func NewCommand(opts *internal.ToolboxOptions) *cobra.Command {
 
 	// Set server version
 	opts.Cfg.Version = versionString
-	opts.VersionNum = strings.TrimSpace(versionNum)
 
 	// set baseCmd in, out and err the same as cmd.
 	cmd.SetIn(opts.IOStreams.In)
@@ -448,9 +446,14 @@ func run(cmd *cobra.Command, opts *internal.ToolboxOptions) error {
 		_ = shutdown(ctx)
 	}()
 
-	isCustomConfigured, err := opts.LoadConfig(ctx, &internal.ConfigParser{})
-	if err != nil {
-		return err
+	// In DB mode, connections are managed via the REST API and loaded from the
+	// management DB at startup — there is no YAML config file to load.
+	isCustomConfigured := false
+	if opts.Cfg.ConfigMode != "db" {
+		isCustomConfigured, err = opts.LoadConfig(ctx, &internal.ConfigParser{})
+		if err != nil {
+			return err
+		}
 	}
 
 	// Validate ToolboxUrl if MCP Auth is enabled
@@ -476,12 +479,6 @@ func run(cmd *cobra.Command, opts *internal.ToolboxOptions) error {
 		return errMsg
 	}
 
-	useTLS := opts.Cfg.CertFile != "" || opts.Cfg.KeyFile != ""
-	protocol := "http"
-	if useTLS {
-		protocol = "https"
-	}
-
 	// run server in background
 	srvErr := make(chan error)
 	if opts.Cfg.Stdio {
@@ -500,6 +497,10 @@ func run(cmd *cobra.Command, opts *internal.ToolboxOptions) error {
 			return errMsg
 		}
 		opts.Logger.InfoContext(ctx, "Server ready to serve!")
+		protocol := "http"
+		if opts.Cfg.CertFile != "" || opts.Cfg.KeyFile != "" {
+			protocol = "https"
+		}
 		if opts.Cfg.UI {
 			opts.Logger.InfoContext(ctx, fmt.Sprintf("Toolbox UI is up and running at: %s://%s:%d/ui", protocol, opts.Cfg.Address, opts.Cfg.Port))
 		}

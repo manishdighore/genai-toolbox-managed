@@ -32,6 +32,30 @@ func webRouter() (chi.Router, error) {
 	return r, nil
 }
 
+// docsRouter serves the Scalar API reference UI at /docs and the raw OpenAPI
+// spec at /openapi.yaml. Both are embedded into the binary at build time.
+func docsRouter() chi.Router {
+	r := chi.NewRouter()
+	r.Use(middleware.StripSlashes)
+
+	// Scalar UI — interactive API docs
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) { serveHTML(w, r, "static/docs.html") })
+
+	// Raw OpenAPI spec — consumed by the Scalar UI and any external tooling
+	r.Get("/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
+		data, err := staticContent.ReadFile("static/openapi.yaml")
+		if err != nil {
+			http.Error(w, "openapi.yaml not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/yaml")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+	})
+
+	return r
+}
+
 func serveHTML(w http.ResponseWriter, r *http.Request, filepath string) {
 	file, err := staticContent.Open(filepath)
 	if err != nil {

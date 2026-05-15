@@ -1,0 +1,37 @@
+# Git
+.git
+.github
+.gitignore
+
+# Local SQLite data files — never bake credentials into the image
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Docs — not needed in the binary (static assets are embedded via go:embed)
+docs/
+.hugo/
+.gemini/
+*.md
+!go.mod
+!go.sum
+
+# Test files
+*_test.go
+tests/
+
+# Local dev artifacts
+toolbox
+toolbox-*
+*.out
+*.prof
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
