@@ -1,3 +1,14 @@
+# db-mcp local-mode compose file.
+#
+# Configuration is loaded from `.env` (gitignored). Copy `.env.example`
+# to `.env` first, generate a key via `openssl rand -hex 32`, and you're
+# ready: `docker compose up`.
+#
+# DBMCP_APP_KEY in .env is the master key db-mcp uses to envelope-encrypt
+# rows it inserts into the shared `credentials` table. Losing it means
+# all stored DB passwords are unrecoverable — back it up like any other
+# production secret.
+
 services:
   dbmcp:
     build:
@@ -9,30 +20,32 @@ services:
     image: dbmcp:local
     ports:
       - "5001:5001"
-    volumes:
-      # SQLite data persisted on the host — never inside the image.
-      - dbmcp-data:/data
+    # Load DBMCP_APP_KEY and PG_* from .env (must exist alongside this file).
+    env_file:
+      - .env
     environment:
-      # Required: 32-byte hex key for AES-256-GCM encryption of secrets.
-      # Generate with: openssl rand -hex 32
-      - TOOLBOX_ENCRYPTION_KEY=${DBMCP_ENCRYPTION_KEY:?DBMCP_ENCRYPTION_KEY is required}
-    # Pass all flags via CMD override so they're visible in `docker inspect`.
+      # Re-expose as the canonical name the binary reads. If unset, compose
+      # will fail with a clear "variable is not set" error pointing to .env.
+      DBMCP_APP_KEY: ${DBMCP_APP_KEY:?run "openssl rand -hex 32" and add DBMCP_APP_KEY=<that> to .env}
     command:
       - "--config-mode=db"
       - "--security-tier=local"
+      # Bind to 0.0.0.0 inside the container so Docker port forwarding works.
+      # Without this the server only listens on the container's loopback.
+      - "--address=0.0.0.0"
       - "--port=5001"
-      - "--db-url=file:/data/dbmcp.sqlite?_journal_mode=WAL"
-      - "--secrets-backend=sqlite"
-      - "--secrets-file=/data/dbmcp-secrets.sqlite"
-      - "--encryption-key=${DBMCP_ENCRYPTION_KEY}"
+      # Postgres target. PG_* come from .env (with sensible defaults that match
+      # AgentForge's dev compose). The DSN is plain `postgres://` — db-mcp's
+      # pgx driver does not parse SQLAlchemy-style `postgresql+asyncpg://`.
+      - "--db-url=postgres://${PG_USER:-agentforge}:${PG_PASS:-agentforge}@${PG_HOST:-host.docker.internal}:${PG_PORT:-5432}/${PG_DB:-agentforge}?sslmode=${PG_SSLMODE:-disable}"
+      - "--secrets-backend=credentials"
+      - "--app-key=${DBMCP_APP_KEY}"
     restart: unless-stopped
+    # Healthcheck uses /proc TCP listen state since the distroless image has
+    # no wget/curl/nc. /proc/net/tcp lists local listening sockets; 0x1389 = 5001.
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:5001/ || exit 1"]
+      test: ["CMD-SHELL", "grep -q ' 00000000:1389 ' /proc/net/tcp || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
-
-volumes:
-  dbmcp-data:
-    driver: local
+      start_period: 5s

@@ -91,16 +91,17 @@ type ServerConfig struct {
 	ConfigMode string
 	// SecurityTier is one of "local", "enterprise", or "saas".
 	SecurityTier string
-	// DBURL is the DSN for the connection management database.
-	//   SQLite:   "file:./dbmcp.sqlite?_journal_mode=WAL"
-	//   Postgres: "postgres://user:pass@host/dbmcp"
+	// DBURL is the Postgres DSN for the management DB.
+	//   e.g. "postgres://user:pass@host:5432/dbname?sslmode=require"
 	DBURL string
-	// SecretsBackend selects the secrets provider: "sqlite", "gcp", "aws", or "azure".
+	// SecretsBackend selects the secrets provider: "credentials", "gcp", "aws", or "azure".
 	SecretsBackend string
-	// SecretsFile is the path to the SQLite secrets file (sqlite backend only).
-	SecretsFile string
-	// EncryptionKey is a 32-byte hex string for AES-256-GCM encryption (sqlite backend only).
-	EncryptionKey string
+	// AppKey is a 32-byte hex master key used by the credentials backend to
+	// envelope-encrypt rows it inserts into the shared credentials table.
+	AppKey string
+	// CredentialsOwner is the owner_id value stamped on rows db-mcp writes
+	// into the credentials table. Defaults to "db-mcp" if empty.
+	CredentialsOwner string
 	// GCPProject is the GCP project ID (gcp backend only).
 	GCPProject string
 	// AWSRegion is the AWS region (aws backend only).

@@ -484,16 +484,16 @@ func createConnectionHandler(s *Server, w http.ResponseWriter, r *http.Request) 
 		ssl = "require"
 	}
 	conn := &connections.Connection{
-		Name:        req.Name,
-		DBType:      req.DBType,
-		Host:        req.Host,
-		Port:        req.Port,
-		Database:    req.Database,
-		Username:    req.Username,
-		SSLMode:     ssl,
-		Description: req.Description,
-		PasswordRef: secretRef,
-		ExtraParams: connections.ExtraParamsMarshal(req.ExtraParams),
+		Name:         req.Name,
+		DBType:       req.DBType,
+		Host:         req.Host,
+		Port:         req.Port,
+		Database:     req.Database,
+		Username:     req.Username,
+		SSLMode:      ssl,
+		Description:  req.Description,
+		PasswordRef:  secretRef,
+		ExtraParams:  connections.ExtraParamsMarshal(req.ExtraParams),
 	}
 	if err := s.connStore.Create(r.Context(), conn); err != nil {
 		// Secret was stored but DB insert failed — clean up the secret so

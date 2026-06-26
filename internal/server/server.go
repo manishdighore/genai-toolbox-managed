@@ -437,8 +437,9 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 
 		secretsProvider, err := secrets.New(ctx, secrets.Config{
 			Backend:          secrets.Backend(cfg.SecretsBackend),
-			SecretsFile:      cfg.SecretsFile,
-			EncryptionKey:    cfg.EncryptionKey,
+			DBURL:            cfg.DBURL,
+			AppKey:           cfg.AppKey,
+			CredentialsOwner: cfg.CredentialsOwner,
 			GCPProject:       cfg.GCPProject,
 			AWSRegion:        cfg.AWSRegion,
 			AzureKeyVaultURL: cfg.AzureKeyVaultURL,

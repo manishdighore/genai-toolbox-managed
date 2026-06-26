@@ -414,15 +414,16 @@ func confirmConnectionHandler(s *Server, w http.ResponseWriter, r *http.Request)
 		ssl = "require"
 	}
 	conn := &connections.Connection{
-		Name:        pending.Request.Name,
-		DBType:      pending.Request.DBType,
-		Host:        pending.Request.Host,
-		Port:        pending.Request.Port,
-		Database:    pending.Request.Database,
-		Username:    pending.Request.Username,
-		SSLMode:     ssl,
-		Description: pending.Request.Description,
-		PasswordRef: pending.SecretRef,
+		Name:         pending.Request.Name,
+		DBType:       pending.Request.DBType,
+		Host:         pending.Request.Host,
+		Port:         pending.Request.Port,
+		Database:     pending.Request.Database,
+		Username:     pending.Request.Username,
+		SSLMode:      ssl,
+		Description:  pending.Request.Description,
+		PasswordRef:  pending.SecretRef,
+		ExtraParams:  connections.ExtraParamsMarshal(pending.Request.ExtraParams),
 	}
 	if err := s.connStore.Create(r.Context(), conn); err != nil {
 		_ = render.Render(w, r, newErrResponse(

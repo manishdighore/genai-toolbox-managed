@@ -8,7 +8,8 @@
 
 // Package connections manages the management database that stores DB connection
 // metadata. Credentials are never stored here — only references to secrets
-// stored in the configured secrets backend (GCP / AWS / Azure / plaintext).
+// stored in the configured secrets backend (GCP / AWS / Azure / the shared
+// `credentials` table).
 package connections
 
 import (
@@ -20,28 +21,25 @@ import (
 // Stored in the management DB. Passwords are NEVER stored here.
 type Connection struct {
 	ID          string `db:"id"`
-	Name        string `db:"name"`        // unique; used as toolset name → /mcp/{name}
-	DBType      string `db:"db_type"`     // postgres | mysql | mongodb | redis | ...
+	Name        string `db:"name"`    // unique; used as toolset name → /mcp/{name}
+	DBType      string `db:"db_type"` // postgres | mysql | mongodb | redis | ...
 	Host        string `db:"host"`
 	Port        int    `db:"port"`
 	Database    string `db:"database"`
 	Username    string `db:"username"`
-	SSLMode     string `db:"ssl_mode"`    // disable | require | verify-full
+	SSLMode     string `db:"ssl_mode"` // disable | require | verify-full
 	Description string `db:"description"`
 
 	// PasswordRef is the opaque reference stored in the secrets backend.
 	// Format depends on the backend in use:
-	//   GCP:       "projects/PROJECT/secrets/NAME/versions/latest"
-	//   AWS:       "arn:aws:secretsmanager:REGION:ACCOUNT:secret:NAME"
-	//   Azure:     "https://VAULT.vault.azure.net/secrets/NAME"
-	//   Plaintext: "enc:BASE64_AES_GCM_CIPHERTEXT"
+	//   GCP:          "projects/PROJECT/secrets/NAME/versions/latest"
+	//   AWS:          "arn:aws:secretsmanager:REGION:ACCOUNT:secret:NAME"
+	//   Azure:        "https://VAULT.vault.azure.net/secrets/NAME"
+	//   Credentials:  "cred:<uuid>" — row id in the shared credentials table
 	PasswordRef string `db:"password_ref"`
 
 	// ExtraParams stores database-specific parameters as a JSON object.
 	// Used for fields that don't fit the standard host/port/user/database model.
-	//   Snowflake:     {"schema":"PUBLIC","warehouse":"COMPUTE_WH"}
-	//   Neo4j:         {"uri_scheme":"bolt"}   (builds bolt://host:port)
-	//   MongoDB:       {"uri":"mongodb+srv://..."}  (full URI, overrides host/port/user)
 	ExtraParams string `db:"extra_params"` // JSON, default "{}"
 
 	LastTestedAt *time.Time `db:"last_tested_at"`
@@ -64,8 +62,6 @@ type CreateRequest struct {
 	CredentialToken string            `json:"credential_token"` // single-use staged token (all tiers, preferred)
 	SSLMode         string            `json:"ssl_mode"`
 	Description     string            `json:"description"`
-	// ExtraParams holds database-specific parameters not covered by the standard fields.
-	// See DATABASES.md for per-database keys.
 	ExtraParams     map[string]string `json:"extra_params,omitempty"`
 }
 
@@ -105,7 +101,7 @@ type Response struct {
 }
 
 // ExtraParamsMap parses the stored JSON extra_params into a map.
-// Returns an empty map if the field is empty or invalid.
+// Returns nil if the field is empty or invalid.
 func (c *Connection) ExtraParamsMap() map[string]string {
 	if c.ExtraParams == "" || c.ExtraParams == "{}" {
 		return nil

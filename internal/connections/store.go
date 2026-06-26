@@ -11,11 +11,13 @@ package connections
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	_ "modernc.org/sqlite" // pure-Go SQLite driver, no CGO required
+	_ "github.com/jackc/pgx/v5/stdlib" // pgx Postgres driver, registered as "pgx"
 )
 
 // Store provides CRUD access to the connections management database.
@@ -25,18 +27,19 @@ type Store struct {
 }
 
 // NewStore opens (or creates) the management database and runs migrations.
-// dsn examples:
+// dsn must be a Postgres DSN, e.g.:
 //
-//	SQLite:   "file:./dbmcp.sqlite?_journal_mode=WAL"
-//	Postgres: "postgres://user:pass@host:5432/dbmcp?sslmode=require"
+//	postgres://user:pass@host:5432/dbname?sslmode=require
+//	postgresql://user:pass@host:5432/dbname?sslmode=disable
 func NewStore(dsn string) (*Store, error) {
-	// Detect driver from DSN prefix.
-	driver := "sqlite"
-	if len(dsn) > 8 && dsn[:8] == "postgres" {
-		driver = "postgres"
+	if dsn == "" {
+		return nil, errors.New("--db-url is required (Postgres DSN)")
+	}
+	if !(strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://")) {
+		return nil, fmt.Errorf("--db-url must be a Postgres DSN, got %q", dsn)
 	}
 
-	db, err := sql.Open(driver, dsn)
+	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening management DB: %w", err)
 	}
@@ -56,8 +59,6 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec(schema); err != nil {
 		return err
 	}
-	// Apply best-effort alterations (e.g. ADD COLUMN for existing databases).
-	// Errors are silently ignored — duplicate column errors are expected on re-runs.
 	for _, alt := range alterations {
 		s.db.Exec(alt) //nolint:errcheck
 	}
@@ -82,13 +83,14 @@ func (s *Store) Create(ctx context.Context, conn *Connection) error {
 		conn.ExtraParams = "{}"
 	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO connections
+		INSERT INTO db_connections
 			(id, name, db_type, host, port, database, username, ssl_mode, description, password_ref, extra_params, created_at, updated_at)
 		VALUES
-			(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 		conn.ID, conn.Name, conn.DBType, conn.Host, conn.Port,
 		conn.Database, conn.Username, conn.SSLMode, conn.Description,
-		conn.PasswordRef, conn.ExtraParams, conn.CreatedAt, conn.UpdatedAt,
+		conn.PasswordRef, conn.ExtraParams,
+		conn.CreatedAt, conn.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("inserting connection %q: %w", conn.Name, err)
@@ -98,12 +100,20 @@ func (s *Store) Create(ctx context.Context, conn *Connection) error {
 
 // Get retrieves a connection by ID.
 func (s *Store) Get(ctx context.Context, id string) (*Connection, error) {
-	return s.scanOne(ctx, `SELECT * FROM connections WHERE id = ?`, id)
+	return s.scanOne(ctx, `
+		SELECT id, name, db_type, host, port, database, username,
+		       ssl_mode, description, password_ref, extra_params,
+		       last_tested_at, last_test_ok, created_at, updated_at
+		FROM db_connections WHERE id = $1`, id)
 }
 
 // GetByName retrieves a connection by name.
 func (s *Store) GetByName(ctx context.Context, name string) (*Connection, error) {
-	return s.scanOne(ctx, `SELECT * FROM connections WHERE name = ?`, name)
+	return s.scanOne(ctx, `
+		SELECT id, name, db_type, host, port, database, username,
+		       ssl_mode, description, password_ref, extra_params,
+		       last_tested_at, last_test_ok, created_at, updated_at
+		FROM db_connections WHERE name = $1`, name)
 }
 
 // List returns all connections ordered by name.
@@ -112,7 +122,7 @@ func (s *Store) List(ctx context.Context) ([]*Connection, error) {
 		SELECT id, name, db_type, host, port, database, username,
 		       ssl_mode, description, password_ref, extra_params,
 		       last_tested_at, last_test_ok, created_at, updated_at
-		FROM connections ORDER BY name ASC`)
+		FROM db_connections ORDER BY name ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("listing connections: %w", err)
 	}
@@ -130,23 +140,22 @@ func (s *Store) List(ctx context.Context) ([]*Connection, error) {
 }
 
 // Update applies an UpdateRequest to a stored connection.
-// Only non-nil fields are changed. UpdatedAt is always refreshed.
 // PasswordRef must already be updated by the caller before calling Update
 // (the caller rotates the secret in the secrets backend first).
 func (s *Store) Update(ctx context.Context, conn *Connection) error {
 	conn.UpdatedAt = time.Now().UTC()
 	_, err := s.db.ExecContext(ctx, `
-		UPDATE connections SET
-			host         = ?,
-			port         = ?,
-			database     = ?,
-			username     = ?,
-			ssl_mode     = ?,
-			description  = ?,
-			password_ref = ?,
-			extra_params = ?,
-			updated_at   = ?
-		WHERE id = ?`,
+		UPDATE db_connections SET
+			host          = $1,
+			port          = $2,
+			database      = $3,
+			username      = $4,
+			ssl_mode      = $5,
+			description   = $6,
+			password_ref  = $7,
+			extra_params  = $8,
+			updated_at    = $9
+		WHERE id = $10`,
 		conn.Host, conn.Port, conn.Database, conn.Username,
 		conn.SSLMode, conn.Description, conn.PasswordRef,
 		conn.ExtraParams, conn.UpdatedAt, conn.ID,
@@ -159,7 +168,7 @@ func (s *Store) Update(ctx context.Context, conn *Connection) error {
 
 // Delete removes a connection by ID.
 func (s *Store) Delete(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM connections WHERE id = ?`, id)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM db_connections WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("deleting connection %q: %w", id, err)
 	}
@@ -170,7 +179,7 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 func (s *Store) UpdateTestResult(ctx context.Context, id string, ok bool) error {
 	now := time.Now().UTC()
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE connections SET last_tested_at = ?, last_test_ok = ?, updated_at = ? WHERE id = ?`,
+		`UPDATE db_connections SET last_tested_at = $1, last_test_ok = $2, updated_at = $3 WHERE id = $4`,
 		now, ok, now, id,
 	)
 	return err
@@ -179,12 +188,15 @@ func (s *Store) UpdateTestResult(ctx context.Context, id string, ok bool) error 
 // NameExists returns true if a connection with the given name already exists.
 func (s *Store) NameExists(ctx context.Context, name string) (bool, error) {
 	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM connections WHERE name = ?`, name).Scan(&count)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM db_connections WHERE name = $1`,
+		name,
+	).Scan(&count)
 	return count > 0, err
 }
 
-// scanOne runs a query and scans exactly one row into a Connection.
-// scanOne runs a query and scans exactly one row. The query must SELECT all columns including extra_params.
+// scanOne runs a query that returns at most one row. The SELECT list must
+// match the column order used by scanConnection.
 func (s *Store) scanOne(ctx context.Context, query string, args ...any) (*Connection, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -213,7 +225,8 @@ func scanConnection(s scanner, c *Connection) error {
 	return s.Scan(
 		&c.ID, &c.Name, &c.DBType, &c.Host, &c.Port,
 		&c.Database, &c.Username, &c.SSLMode, &c.Description,
-		&c.PasswordRef, &c.ExtraParams, &c.LastTestedAt, &c.LastTestOK,
+		&c.PasswordRef, &c.ExtraParams,
+		&c.LastTestedAt, &c.LastTestOK,
 		&c.CreatedAt, &c.UpdatedAt,
 	)
 }
